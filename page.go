@@ -143,31 +143,37 @@ func (f Font) Encoder() TextEncoding {
 		case "MacRomanEncoding":
 			return &byteEncoder{&macRomanEncoding}
 		case "Identity-H":
-			// TODO: Should be big-endian UCS-2 decoder
-			return &nopEncoder{}
+			// TODO: This is probably not correct.
+			toUnicode := f.V.Key("ToUnicode")
+			switch toUnicode.Kind() {
+			default:
+				panic("missing ToUnicode: " + toUnicode.Kind().String())
+			case Dict, Stream:
+				m := readCmap(toUnicode)
+				if m == nil {
+					panic("nil cmap in ToUnicode")
+				}
+				return m
+			}
 		default:
-			println("unknown encoding", enc.Name())
-			return &nopEncoder{}
+			panic(fmt.Errorf("unknown encoding %s", enc.Name()))
 		}
 	case Dict:
 		return &dictEncoder{enc.Key("Differences")}
 	case Null:
-		// ok, try ToUnicode
-	default:
-		println("unexpected encoding", enc.String())
-		return &nopEncoder{}
-	}
-
-	toUnicode := f.V.Key("ToUnicode")
-	if toUnicode.Kind() == Dict {
-		m := readCmap(toUnicode)
-		if m == nil {
-			return &nopEncoder{}
+		toUnicode := f.V.Key("ToUnicode")
+		if toUnicode.Kind() == Dict {
+			m := readCmap(toUnicode)
+			if m == nil {
+				return &nopEncoder{}
+			}
+			return m
 		}
-		return m
-	}
 
-	return &byteEncoder{&pdfDocEncoding}
+		return &byteEncoder{&pdfDocEncoding}
+	default:
+		panic(fmt.Errorf("unexpected encoding %s", enc.String()))
+	}
 }
 
 type dictEncoder struct {
@@ -254,22 +260,15 @@ Parse:
 								r = append(r, []rune(utf16Decode(s))...)
 								continue Parse
 							}
-							if bf.dst.Kind() == Array {
-								fmt.Printf("array %v\n", bf.dst)
-							} else {
-								fmt.Printf("unknown dst %v\n", bf.dst)
-							}
 							r = append(r, noRune)
 							continue Parse
 						}
 					}
-					fmt.Printf("no text for %q", text)
 					r = append(r, noRune)
 					continue Parse
 				}
 			}
 		}
-		println("no code space found")
 		r = append(r, noRune)
 		raw = raw[1:]
 	}
@@ -294,7 +293,8 @@ func readCmap(toUnicode Value) *cmap {
 		case "findresource":
 			category := stk.Pop()
 			key := stk.Pop()
-			fmt.Println("findresource", key, category)
+			_, _ = key, category
+			// panic(fmt.Errorf("findresource %s %s", key, category))
 			stk.Push(newDict())
 		case "begincmap":
 			stk.Push(newDict())
@@ -304,14 +304,14 @@ func readCmap(toUnicode Value) *cmap {
 			n = int(stk.Pop().Int64())
 		case "endcodespacerange":
 			if n < 0 {
-				println("missing begincodespacerange")
+				panic("missing begincodespacerange")
 				ok = false
 				return
 			}
 			for i := 0; i < n; i++ {
 				hi, lo := stk.Pop().RawString(), stk.Pop().RawString()
 				if len(lo) == 0 || len(lo) != len(hi) {
-					println("bad codespace range")
+					panic("bad codespace range")
 					ok = false
 					return
 				}
@@ -332,10 +332,11 @@ func readCmap(toUnicode Value) *cmap {
 			category := stk.Pop().Name()
 			value := stk.Pop()
 			key := stk.Pop().Name()
-			fmt.Println("defineresource", key, value, category)
+			_, _, _ = category, key, value
+			// panic(fmt.Errorf("defineresource %s %s %s", key, value, category))
 			stk.Push(value)
 		default:
-			println("interp\t", op)
+			panic(fmt.Errorf("interp\t%s", op))
 		}
 	})
 	if !ok {
@@ -404,7 +405,23 @@ type gstate struct {
 
 // Content returns the page's content.
 func (p Page) Content() Content {
-	strm := p.V.Key("Contents")
+	switch v := p.V.Key("Contents"); v.Kind() {
+	case Stream:
+		return p.contentForStream(v)
+	case Array:
+		var c Content
+		for i := 0; i < v.Len(); i++ {
+			cfs := p.contentForStream(v.Index(i))
+			c.Text = append(c.Text, cfs.Text...)
+			c.Rect = append(c.Rect, cfs.Rect...)
+		}
+		return c
+	default:
+		panic(fmt.Errorf("bad content kind: %v ... %v", p.V.Kind(), p.V.Keys()))
+	}
+}
+
+func (p Page) contentForStream(strm Value) Content {
 	var enc TextEncoding = &nopEncoder{}
 
 	var g = gstate{
@@ -414,25 +431,13 @@ func (p Page) Content() Content {
 
 	var text []Text
 	showText := func(s string) {
-		n := 0
-		for _, ch := range enc.Decode(s) {
-			Trm := matrix{{g.Tfs * g.Th, 0, 0}, {0, g.Tfs, 0}, {0, g.Trise, 1}}.mul(g.Tm).mul(g.CTM)
-			w0 := g.Tf.Width(int(s[n]))
-			n++
-			if ch != ' ' {
-				f := g.Tf.BaseFont()
-				if i := strings.Index(f, "+"); i >= 0 {
-					f = f[i+1:]
-				}
-				text = append(text, Text{f, Trm[0][0], Trm[2][0], Trm[2][1], w0 / 1000 * Trm[0][0], string(ch)})
-			}
-			tx := w0/1000*g.Tfs + g.Tc
-			if ch == ' ' {
-				tx += g.Tw
-			}
-			tx *= g.Th
-			g.Tm = matrix{{1, 0, 0}, {0, 1, 0}, {tx, 0, 1}}.mul(g.Tm)
+		x := enc.Decode(s)
+		f := g.Tf.BaseFont()
+		if i := strings.Index(f, "+"); i >= 0 {
+			f = f[i+1:]
 		}
+		Trm := matrix{{g.Tfs * g.Th, 0, 0}, {0, g.Tfs, 0}, {0, g.Trise, 1}}.mul(g.Tm).mul(g.CTM)
+		text = append(text, Text{f, Trm[0][0], Trm[2][0], Trm[2][1], Trm[0][0], x})
 	}
 
 	var rect []Rect
@@ -445,7 +450,7 @@ func (p Page) Content() Content {
 		}
 		switch op {
 		default:
-			//fmt.Println(op, args)
+			// panic(fmt.Errorf("op not supported: %q", op))
 			return
 
 		case "cm": // update g.CTM
@@ -485,9 +490,12 @@ func (p Page) Content() Content {
 			gstack = append(gstack, g)
 
 		case "Q": // restore graphics state
-			n := len(gstack) - 1
-			g = gstack[n]
-			gstack = gstack[:n]
+			// gstack should not be empty...but sometimes it is
+			if len(gstack) > 0 {
+				n := len(gstack) - 1
+				g = gstack[n]
+				gstack = gstack[:n]
+			}
 
 		case "BT": // begin text (reset text matrix and line matrix)
 			g.Tm = ident
@@ -530,7 +538,7 @@ func (p Page) Content() Content {
 			g.Tf = p.Font(f)
 			enc = g.Tf.Encoder()
 			if enc == nil {
-				println("no cmap for", f)
+				panic(fmt.Errorf("no cmap for %s", f))
 				enc = &nopEncoder{}
 			}
 			g.Tfs = args[1].Float64()

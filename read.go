@@ -328,7 +328,7 @@ func readXrefStreamData(r *Reader, strm stream, table []xref, size int64) ([]xre
 			case 2:
 				table[x] = xref{ptr: objptr{uint32(x), 0}, inStream: true, stream: objptr{uint32(v2), 0}, offset: int64(v3)}
 			default:
-				fmt.Printf("invalid xref stream type %d: %x\n", v1, buf)
+				return table, fmt.Errorf("invalid xref stream type %d: %x\n", v1, buf)
 			}
 		}
 	}
@@ -450,6 +450,8 @@ type Value struct {
 func (v Value) IsNull() bool {
 	return v.data == nil
 }
+
+//go:generate stringer -type=ValueKind
 
 // A ValueKind specifies the kind of data underlying a Value.
 type ValueKind int
@@ -834,8 +836,7 @@ func applyFilter(rd io.Reader, name string, param Value) io.Reader {
 		columns := param.Key("Columns").Int64()
 		switch pred.Int64() {
 		default:
-			fmt.Println("unknown predictor", pred)
-			panic("pred")
+			panic(fmt.Errorf("unknown predictor: %v", pred))
 		case 12:
 			return &pngUpReader{r: zr, hist: make([]byte, 1+columns), tmp: make([]byte, 1+columns)}
 		}
